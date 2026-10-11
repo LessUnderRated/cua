@@ -904,12 +904,23 @@ impl WindowOverlays {
         for dialog in &self.dialogs {
             let id = dialog["window_id"].as_u64().unwrap_or(0);
             let owning_pid = dialog.get("owning_pid").and_then(|v| v.as_u64());
+            // Wayland compositors do not expose transient-for or modality, so
+            // a dialog detected there is named by structure (same pid,
+            // overlapping rectangle) instead of an X11 hint.
+            let relation = if dialog.get("transient_for").is_some_and(Value::is_null) {
+                "same application".to_string()
+            } else {
+                format!(
+                    "transient of window {}",
+                    dialog["transient_for"].as_u64().unwrap_or(0)
+                )
+            };
             parts.push(format!(
-                "dialog \"{}\" (window_id {id}, transient of window {}{}{}) is open over this \
+                "dialog \"{}\" (window_id {id}, {}{}{}) is open over this \
                  window: call get_window_state(pid={pid}, window_id={id}) to index it and act \
                  there (pid-only keys go to it).",
                 dialog["title"].as_str().unwrap_or(""),
-                dialog["transient_for"].as_u64().unwrap_or(0),
+                relation,
                 if dialog["modal"].as_bool() == Some(true) {
                     ", modal"
                 } else {
@@ -1011,6 +1022,45 @@ fn window_overlays(pid: u32, xid: u64) -> WindowOverlays {
         out.popups.push(popup.to_json());
     }
     out.covers_window = covers;
+    out
+}
+
+/// Wayland counterpart of [`window_overlays`]: Hyprland (and other Wayland
+/// compositors) expose no transient-for or modality, so a same-client dialog
+/// is detected structurally — another mapped window of the same pid whose
+/// rectangle overlaps the target. `transient_for`/`modal` are reported as
+/// null; `floating` is the compositor's own hint that a surface is a dialog.
+/// The detector is advisory: it names suspects for the caller, it never
+/// claims which surface received a dispatch.
+fn wayland_window_overlays(pid: u32, xid: u64) -> WindowOverlays {
+    let windows = crate::wayland::list_windows_dispatch(Some(pid));
+    let mut out = WindowOverlays {
+        window_rect: windows
+            .iter()
+            .find(|w| w.xid == xid)
+            .map(|w| (w.x, w.y, w.width, w.height)),
+        ..Default::default()
+    };
+    let Some(target_rect) = out.window_rect else {
+        return out;
+    };
+    for window in windows {
+        if window.xid == xid || !window.is_on_screen || window.width == 0 || window.height == 0 {
+            continue;
+        }
+        let rect = (window.x, window.y, window.width, window.height);
+        if !rects_intersect(target_rect, rect) {
+            continue;
+        }
+        out.covers_window = true;
+        out.dialogs.push(json!({
+            "window_id": window.xid,
+            "title": window.title,
+            "transient_for": Value::Null,
+            "modal": Value::Null,
+            "bounds": { "x": window.x, "y": window.y, "width": window.width, "height": window.height },
+        }));
+    }
     out
 }
 
@@ -1371,9 +1421,11 @@ impl Tool for GetWindowStateTool {
             // Same-pid popups (menus, combo lists) and transient dialogs mapped
             // over this window: listed for the caller, and when one overlaps
             // the window the screenshot is taken from the screen, since the
-            // window's own drawable never shows them.
+            // window's own drawable never shows them. On Wayland the overlay
+            // detection is structural (same pid, overlapping rectangles);
+            // compositor-side transient-for hints do not exist there.
             let overlays = if crate::wayland::is_wayland() {
-                WindowOverlays::default()
+                wayland_window_overlays(pid, xid)
             } else {
                 window_overlays(pid, xid)
             };
@@ -4541,6 +4593,46 @@ fn isolated_hyprland_task_error(error: tokio::task::JoinError, acknowledged: boo
     )))
 }
 
+/// A background dispatch the plugin admitted can still be dropped by the
+/// toolkit: when another window of the same Wayland client — a first-run
+/// wizard, a transient dialog — holds the client's input, the synthetic
+/// events never reach the target surface and the effect stays unverifiable.
+/// Name those windows on the result so the caller can ground on a dialog and
+/// resolve it instead of blindly retrying. Observation only: the annotation
+/// never changes the effect or the action record.
+fn annotate_wayland_client_blockers(result: ToolResult, pid: u32, xid: u64) -> ToolResult {
+    annotate_blockers_from_overlays(result, pid, &wayland_window_overlays(pid, xid))
+}
+
+fn annotate_blockers_from_overlays(
+    mut result: ToolResult,
+    pid: u32,
+    overlays: &WindowOverlays,
+) -> ToolResult {
+    // Successful isolated dispatches close out as text-only results whose
+    // truth rides in the execution record (`publish_action_result` later
+    // projects structured content from that record), so read the record
+    // rather than structured content here.
+    let dispatched_unverifiable = result.action_record.as_ref().is_some_and(|record| {
+        record.effect == cua_driver_core::action_record::ActionEffect::Unverifiable
+            && record.transport
+                == cua_driver_core::action_record::ActionTransport::LinuxHyprlandIsolatedInput
+    });
+    if !dispatched_unverifiable || overlays.dialogs.is_empty() {
+        return result;
+    }
+    // The public ActionResult projection narrows structured content to the
+    // closed envelope, so the blocker note travels as an extra text block
+    // (client-visible) instead of structured keys.
+    let note = overlays
+        .follow_up(pid)
+        .unwrap_or_else(|| "a dialog of this application is open over the target".to_string());
+    result
+        .content
+        .push(cua_driver_core::protocol::Content::text(note));
+    result
+}
+
 fn spawn_isolated_hyprland(
     args: &Value,
     work: impl FnOnce(crate::wayland::hyprland_input::ActionCancellation) -> anyhow::Result<Value>
@@ -4595,7 +4687,7 @@ async fn isolated_hyprland_action(
         Err(refusal) => return refusal,
     };
     match dispatch.await {
-        Ok(result) => isolated_hyprland_result(result),
+        Ok(result) => annotate_wayland_client_blockers(isolated_hyprland_result(result), pid, xid),
         Err(error) => isolated_hyprland_task_error(error, false),
     }
 }
@@ -7551,7 +7643,9 @@ impl Tool for TypeTextTool {
                     Err(refusal) => return refusal,
                 };
             return match dispatch.await {
-                Ok(result) => isolated_hyprland_result(result),
+                Ok(result) => {
+                    annotate_wayland_client_blockers(isolated_hyprland_result(result), pid, xid)
+                }
                 Err(error) => isolated_hyprland_task_error(error, false),
             };
         }

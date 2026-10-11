@@ -279,6 +279,19 @@ control. Other focus-bound background pointer and keyboard shapes return an
 exact `background_unavailable` result. They do not report success after a
 silent drop.
 
+### Same-client dialogs over a Wayland target
+
+`get_window_state` also names same-client dialogs on Wayland: another mapped
+window of the target's pid whose rectangle overlaps the target is listed in
+`dialogs` (with `transient_for` and `modal` reported as null — compositors do
+not expose those hints), and the `follow_up` sentence names the
+`get_window_state` call that indexes the dialog. A background dispatch the
+compositor admitted can still be dropped by the toolkit when such a dialog
+holds the client's input; the action result then carries `blockers` with the
+same windows, so an `effect:"unverifiable"` dispatch is grounded before it is
+retried. Resolve the dialog first (index it with the named
+`get_window_state` call and act on it), then repeat the original action.
+
 Outside an explicitly enabled, qualified compositor-owned background route,
 raw Wayland input requires explicitly authorized `delivery_mode:"foreground"`.
 The driver activates the selected target through a verified compositor adapter

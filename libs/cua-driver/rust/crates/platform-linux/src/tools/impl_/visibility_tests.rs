@@ -133,3 +133,134 @@ fn a_cross_process_dialog_names_its_real_owning_pid_in_the_follow_up() {
         "{note}"
     );
 }
+
+#[test]
+fn a_wayland_dialog_without_transient_hints_is_named_by_structure() {
+    // Hyprland exposes no transient-for or modality, so a same-client dialog
+    // is detected by pid + overlapping rectangle: the follow-up names it as
+    // the target's own application instead of an X11 hint.
+    let overlays = WindowOverlays {
+        dialogs: vec![json!({
+            "window_id": 94353245136640u64, "title": "Tip of the Day: 1/224",
+            "transient_for": Value::Null, "modal": Value::Null,
+            "bounds": {"x": 300, "y": 200, "width": 634, "height": 212}
+        })],
+        popups: vec![],
+        covers_window: true,
+        window_rect: Some((0, 0, 800, 600)),
+    };
+    let note = overlays.follow_up(5).unwrap();
+    assert!(
+        note.contains(
+            "dialog \"Tip of the Day: 1/224\" (window_id 94353245136640, same application)"
+        ),
+        "{note}"
+    );
+    assert!(
+        note.contains("get_window_state(pid=5, window_id=94353245136640)"),
+        "{note}"
+    );
+    assert!(!note.contains("transient of window 0"), "{note}");
+}
+
+#[test]
+fn an_unverifiable_dispatch_names_a_same_client_dialog_as_a_blocker() {
+    // A successful isolated dispatch closes out as a text-only result whose
+    // truth rides in the execution record, exactly as hyprland_input_result
+    // builds it for the background path.
+    let dispatched = ToolResult::text(
+        "Dispatched exact-target Hyprland input; application effect is unverifiable.",
+    )
+    .with_action_record(
+        cua_driver_core::action_record::ActionExecutionRecord::builder(
+            cua_driver_core::action_record::ActionEffect::Unverifiable,
+            cua_driver_core::action_record::ActionTransport::LinuxHyprlandIsolatedInput,
+            cua_driver_core::action_record::RequestedDelivery::Background,
+        )
+        .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+        .build()
+        .expect("isolated input record is valid"),
+    );
+    let annotated = annotate_blockers_from_overlays(
+        dispatched,
+        5,
+        &WindowOverlays {
+            dialogs: vec![json!({
+                "window_id": 77, "title": "Tip of the Day", "transient_for": Value::Null,
+                "modal": Value::Null,
+                "bounds": {"x": 10, "y": 10, "width": 600, "height": 200}
+            })],
+            popups: vec![],
+            covers_window: true,
+            window_rect: Some((0, 0, 800, 600)),
+        },
+    );
+    let notes: Vec<&str> = annotated
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|text| text.contains("window_id 77") && text.contains("same application")),
+        "{notes:?}"
+    );
+    // The producer's dispatch summary stays the first text block so the
+    // closed ActionResult projection keeps it as the summary.
+    assert_eq!(
+        notes.first().copied(),
+        Some("Dispatched exact-target Hyprland input; application effect is unverifiable.")
+    );
+    assert_eq!(annotated.content.len(), 2);
+}
+
+#[test]
+fn a_refused_or_dialog_free_dispatch_carries_no_blocker_annotation() {
+    // A refusal carries a refused record, not an unverifiable one.
+    let refused = ToolResult::error("background_unavailable (primary_target_busy)")
+        .with_action_record(
+            cua_driver_core::action_record::ActionExecutionRecord::builder(
+                cua_driver_core::action_record::ActionEffect::Refused,
+                cua_driver_core::action_record::ActionTransport::LinuxHyprlandIsolatedInput,
+                cua_driver_core::action_record::RequestedDelivery::Background,
+            )
+            .build()
+            .expect("refusal record is valid"),
+        );
+    let untouched = annotate_blockers_from_overlays(
+        refused,
+        5,
+        &WindowOverlays {
+            dialogs: vec![json!({
+                "window_id": 77, "title": "Tip of the Day", "transient_for": Value::Null,
+                "modal": Value::Null,
+                "bounds": {"x": 10, "y": 10, "width": 600, "height": 200}
+            })],
+            popups: vec![],
+            covers_window: true,
+            window_rect: Some((0, 0, 800, 600)),
+        },
+    );
+    assert_eq!(untouched.content.len(), 1);
+
+    let dispatched = ToolResult::text(
+        "Dispatched exact-target Hyprland input; application effect is unverifiable.",
+    )
+    .with_action_record(
+        cua_driver_core::action_record::ActionExecutionRecord::builder(
+            cua_driver_core::action_record::ActionEffect::Unverifiable,
+            cua_driver_core::action_record::ActionTransport::LinuxHyprlandIsolatedInput,
+            cua_driver_core::action_record::RequestedDelivery::Background,
+        )
+        .actual_delivery(cua_driver_core::action_record::ActualDelivery::Background)
+        .build()
+        .expect("isolated input record is valid"),
+    );
+    let no_overlays = WindowOverlays::default();
+    let untouched = annotate_blockers_from_overlays(dispatched, 5, &no_overlays);
+    assert_eq!(untouched.content.len(), 1);
+}
