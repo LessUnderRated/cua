@@ -14,7 +14,7 @@ struct QualifiedPackage {
 const PACKAGES: &[QualifiedPackage] = &[
     QualifiedPackage {
         name: "libreoffice-fresh",
-        version: "26.2.5-3",
+        version: "26.8.1-1",
         executable: "/usr/lib/libreoffice/program/soffice.bin",
     },
     QualifiedPackage {
